@@ -1,0 +1,260 @@
+#!/usr/bin/env python
+
+import sys, os, mimetypes, re, time
+import gobject
+import xmmsclient
+import xmmsclient.glib
+from xmmsclient.collections import *
+import discogs_client as discogs
+
+try:
+    import urllib.request as urllib
+    from urllib.parse import unquote_plus
+except ImportError:
+    from urllib import unquote_plus
+    import urllib2 as urllib
+
+class Source:
+    @staticmethod
+    def search(artist, album):
+        raise NotImplementedError
+
+
+discogs.user_agent = "xmms2-covers/1.0"
+
+class Discogs(Source):
+    @staticmethod
+    def search(artist, album):
+        def clean_str(s):
+            return re.sub(r"[\.,?]", "", s).strip().lower()
+
+        def try_release(album, release):
+            title = clean_str(result.title)
+            if album in title and "images" in result.data:
+                for image in result.data["images"]:
+                    if image["type"] == "primary":
+                        return image["resource_url"]
+
+                for image in result.data["images"]:
+                    if image["type"] == "secondary":
+                        return image["resource_url"]
+
+
+        query = "%s %s" % (artist, album)
+        print("[Discogs] Searching for %s" % query)
+
+        search = discogs.Search(query)
+
+        try:
+            results = search.results()
+        except discogs.HTTPError:
+            return
+
+        album = clean_str(album)
+        results = search.results()
+
+        # Try master releases first
+        for idx, result in enumerate(results):
+            if isinstance(result, discogs.MasterRelease):
+                cover = try_release(album, result)
+                if cover:
+                    return cover
+
+            if idx == 5:
+                break
+
+        for idx, result in enumerate(results):
+            if isinstance(result, discogs.Release):
+                cover = try_release(album, result)
+                if cover:
+                    return cover
+
+            if idx == 10:
+                break
+
+
+class App:
+    AlbumsFetchSpec = {
+        "type": "cluster-dict",
+        "cluster-field": "album",
+        "data": {
+            "type": "organize",
+            "data": {
+                "tracks": {
+                    "type": "metadata",
+                    "get": ["value"],
+                    "fields": ["id"],
+                    "aggregate": "list"
+                },
+                "artists": {
+                    "type": "metadata",
+                    "get": ["field", "value"],
+                    "fields": ["album artist", "artist"],
+                    "aggregate": "set"
+                },
+                "url": {
+                    "type": "metadata",
+                    "get": ["value"],
+                    "fields": ["url"]
+                }
+            }
+        }
+    }
+
+    Sources = [Discogs]
+
+    def __init__(self):
+        self.ml = gobject.MainLoop(None, False)
+        self.client = xmmsclient.XMMS("xmms2-covers")
+        self.added = []
+        self.lastchange = 0
+        self.timeout = None
+
+    def connect(self):
+        try:
+            self.client.connect(os.getenv("XMMS_PATH"), self.on_disconnect)
+        except IOError as msg:
+            print(("[xmms2] Connection failed: {0}").format(msg))
+            sys.exit(1)
+
+        connector = xmmsclient.glib.GLibConnector(self.client)
+        self.on_connect()
+
+    def on_connect(self):
+        self.client.broadcast_medialib_entry_added(self.on_entry_added)
+        self.client.broadcast_medialib_entry_changed(self.on_entry_changed)
+        self.find_albums(Universe())
+
+    def on_disconnect(self, loop):
+        self.ml.quit()
+
+    def on_entry_added(self, result):
+        self.added.append(result.value())
+
+    def on_entry_changed(self, result):
+        if result.value() in self.added:
+            if self.timeout:
+                gobject.source_remove(self.timeout)
+            self.timeout = gobject.timeout_add(5000, self.check_added)
+            self.lastchange = time.time()
+
+    def on_result(self, result):
+        albums = result.value()
+        if albums is None:
+            return
+
+        for album, info in albums.items():
+            cover = self.search_sources(album, info)
+
+            if not cover:
+                cover = self.search_files(album, info)
+
+            if cover:
+                print(("[xmms2] Adding cover art to {0}").format(album))
+                data, mime = self.get_cover(cover)
+                self.update_cover_art(info["tracks"], data, mime)
+
+    def check_added(self):
+        if len(self.added) == 0:
+            return False
+
+        passed = time.time() - self.lastchange
+        if passed > 5:
+            operand = IDList(self.added)
+            self.added = []
+            self.find_albums(operand)
+
+        return False
+
+    def find_albums(self, operand):
+        coll = Complement(Has(operand, field="picture_front"))
+        self.client.coll_query(coll, self.AlbumsFetchSpec, self.on_result)
+
+    def search_sources(self, album, info):
+        if album == "(No value)" or not "artists" in info:
+            return
+
+        artists = []
+
+        if "album artists" in info["artists"]:
+            artists += info["artists"]["album artist"]
+
+        if "artist" in info["artists"]:
+            artists += info["artists"]["artist"]
+
+        if len(artists) > 3:
+            artists = ["Various Artists"]
+
+        cover = None
+        for artist in artists:
+            cover = None
+
+            for source in self.Sources:
+                cover = source.search(artist, album)
+                if cover:
+                    break
+
+            if cover:
+                break
+
+        return cover
+
+    def search_files(self, album, info):
+        url = unquote_plus(str(info["url"]))
+
+        if not url.startswith("file://"):
+            return
+
+        path = os.path.dirname(url[7:])
+
+        for filename in os.listdir(path):
+            (mime, encoding) = mimetypes.guess_type(filename)
+
+            if mime and mime.startswith("image"):
+                val = filename.lower()
+                if "cover" in val or "folder" in val or "front" in val or "albumart" in val:
+                    return os.path.join(path, filename)
+
+    def get_cover_from_url(self, url):
+        fd = urllib.urlopen(url)
+
+        if "Content-Type" in fd.info():
+            mime = fd.info()["Content-Type"]
+        else:
+            (mime, encoding) = mimetypes.guess_type(url)
+
+        data = fd.read()
+        fd.close()
+
+        return data, mime
+
+    def get_cover_from_file(self, path):
+        fd = open(path, "rb")
+        data = fd.read()
+        fd.close()
+
+        (mime, encoding) = mimetypes.guess_type(path)
+
+        return data, mime
+
+    def get_cover(self, path):
+        if path.lower().startswith("http"):
+            return self.get_cover_from_url(path)
+        else:
+            return self.get_cover_from_file(path)
+
+    def update_cover_art(self, mids, data, mime):
+        def on_result(result):
+            bindata = result.value()
+            for mid in mids:
+                self.client.medialib_property_set(mid, "picture_front", bindata)
+                self.client.medialib_property_set(mid, "picture_front_mime", mime)
+
+        self.client.bindata_add(data, on_result)
+
+    def run(self):
+        self.connect()
+        self.ml.run()
+
+app = App()
+app.run()

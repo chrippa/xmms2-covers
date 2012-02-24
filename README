@@ -1,0 +1,4 @@
+Simple cover art fetcher for XMMS2.
+Currently searches Discogs and local directories for cover art.
+
+Just drop it in ~/.config/xmms2/startup.d/ and it will run next time you start XMMS2.
